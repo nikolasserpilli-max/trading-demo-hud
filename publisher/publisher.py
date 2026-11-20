@@ -12,7 +12,7 @@ It never sends orders, never writes to MT5/EA/PTA files and never starts
 any terminal. Only stdlib. Run hidden with pythonw.exe.
 
 Usage:
-  pythonw publisher.py            -> loop forever (default every 60 s)
+  pythonw publisher.py            -> loop forever (default every 30 s)
   python  publisher.py --once     -> one publish and exit
   python  publisher.py --dry      -> build state.json locally, no upload
   python  publisher.py --check    -> check key/known_hosts/git and remote access (never prints keys)
@@ -32,9 +32,11 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DATA_REMOTE = "git@github.com:nikolasserpilli-max/trading-demo-hud-data.git"
-INTERVAL_S = int(os.environ.get("HUD_INTERVAL_S", "60"))
+INTERVAL_S = int(os.environ.get("HUD_INTERVAL_S", "30"))
+SLOT_S = 30
+KEEP_SLOTS = 20
 API_BASE = "http://127.0.0.1:8000"
 API_TIMEOUT = 8
 
@@ -440,7 +442,23 @@ def publish(state: dict) -> bool:
     c, blob, e = git(["hash-object", "-w", "--stdin"], content)
     if c:
         log(f"git hash-object failed: {e[:200]}"); return False
-    c, tree, e = git(["mktree"], f"100644 blob {blob}\tstate.json\n".encode())
+    # immutable per-slot copies (s/<unix//30>.json): never-reused URLs, so the raw CDN cache can't serve old data
+    slots = {}
+    c, out, _ = git(["ls-tree", "refs/heads/main", "s/"])
+    if c == 0:
+        for line in out.splitlines():
+            try:
+                meta, name = line.split("\t", 1)
+                slots[int(Path(name).stem)] = meta.split()[2]
+            except Exception:
+                pass
+    slots[int(time.time() // SLOT_S)] = blob
+    keep = sorted(slots)[-KEEP_SLOTS:]
+    sub = "".join(f"100644 blob {slots[k]}\t{k}.json\n" for k in keep).encode()
+    c, subtree, e = git(["mktree"], sub)
+    if c:
+        log(f"git mktree (slots) failed: {e[:200]}"); return False
+    c, tree, e = git(["mktree"], f"100644 blob {blob}\tstate.json\n040000 tree {subtree}\ts\n".encode())
     if c:
         log(f"git mktree failed: {e[:200]}"); return False
     c, commit, e = git(["commit-tree", tree, "-m", "data: snapshot"])
@@ -449,8 +467,9 @@ def publish(state: dict) -> bool:
     c, _, e = git(["push", "--force", "-q", DATA_REMOTE, f"{commit}:refs/heads/main"], timeout=90)
     if c:
         log(f"git push failed: {e[:300]}"); return False
+    git(["update-ref", "refs/heads/main", commit])
     _cycles += 1
-    if _cycles % 60 == 1:
+    if _cycles % 120 == 1:
         git(["prune", "--expire=now"])  # drop old snapshots kept locally
     return True
 

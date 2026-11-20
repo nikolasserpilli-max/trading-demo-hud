@@ -106,12 +106,12 @@ footer{margin-top:16px;font-size:11px;color:var(--dim);text-align:center;line-he
 <section class="card"><h2>Trend multi-timeframe (EA)</h2><div class="mtf" id="mtf"></div>
   <div class="note">Quadratini da M1 a MN1: verde = trend su, rosso = giù, grigio = neutro. Numero = allineamento (-1…+1).</div></section>
 
-<footer>Dati letti in sola lettura dal PC (VantageMultiEA + API locale di Paper Trading AI). Nessun dato inventato: i valori mancanti non vengono mostrati.<br>Orari in ora di Roma. La pagina si aggiorna da sola ogni 60 secondi.</footer>
+<footer>Dati letti in sola lettura dal PC (VantageMultiEA + API locale di Paper Trading AI). Nessun dato inventato: i valori mancanti non vengono mostrati.<br>Orari in ora di Roma. La pagina si aggiorna da sola ogni 30 secondi.</footer>
 </div>
 
 <script>
 const OWNER='nikolasserpilli-max', REPO='trading-demo-hud-data', BRANCH='main';
-const REFRESH_MS=60000, WARN_S=300, BAD_S=900;
+const REFRESH_MS=30000, WARN_S=300, BAD_S=900;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const has=v=>v!==null&&v!==undefined&&v!=='';
@@ -127,14 +127,22 @@ let S=null, BOTS={};
 function botTag(b,strategy){const k=b||'other';const lbl={scalp:'Scalp',swing:'Swing',h1:'H1',pta:'Paper Trading AI',other:'Altro'}[k]||k;return `<span class="tag t-${esc(k)}">${esc(lbl)}</span>`}
 
 async function load(){
+  // 1) immutable per-30s copies (never-cached-stale URLs), newest first
+  const raw=`https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}`;
+  const c=Math.floor(Date.now()/30000);
+  for(let k=c+1;k>=c-10;k--){
+    try{const r=await fetch(`${raw}/s/${k}.json`,{cache:'no-cache'});if(r.ok){const j=await r.json();if(j&&j.schema){S=j;render();return}}}catch(e){}
+  }
+  // 2) fallbacks: GitHub API (60 req/h per IP), then raw latest (CDN may be up to 5 min old)
   const urls=[
     {u:`https://api.github.com/repos/${OWNER}/${REPO}/contents/state.json?ref=${BRANCH}`,h:{Accept:'application/vnd.github.raw+json'}},
-    {u:`https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/state.json?t=${Date.now()}`,h:{}}
+    {u:`${raw}/state.json`,h:{}}
   ];
   for(const x of urls){
-    try{const r=await fetch(x.u,{headers:x.h,cache:'no-cache'});if(!r.ok)continue;const j=await r.json();if(j&&j.schema){S=j;render();return}}catch(e){}
+    try{const r=await fetch(x.u,{headers:x.h,cache:'no-cache'});if(!r.ok)continue;const j=await r.json();if(j&&j.schema&&(!S||j.generated_at_utc>S.generated_at_utc)){S=j;render();return}}catch(e){}
   }
   if(!S){$('stale').className='bad';$('stale').textContent='Impossibile leggere i dati in questo momento. Riprovo tra poco.'}
+  else render();
 }
 
 function kpi(l,v,s,c){if(v===null)return '';return `<div class="card kpi"><div class="l">${l}</div><div class="v ${c||''}">${v}</div>${s?`<div class="s">${s}</div>`:''}</div>`}
