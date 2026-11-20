@@ -4,7 +4,9 @@
 Reads the VantageMultiEA status file and the local Paper Trading AI API,
 keeps only a whitelisted set of public fields (no passwords, keys, tokens,
 tickets, full account number or local paths) and publishes them as
-state.json on the `data` branch of the GitHub repo that serves the page.
+state.json on `main` of the separate public data repo
+nikolasserpilli-max/trading-demo-hud-data, pushed with git over SSH using a
+per-repo deploy key (write access only to that data repo, not to the page).
 
 It never sends orders, never writes to MT5/EA/PTA files and never starts
 any terminal. Only stdlib. Run hidden with pythonw.exe.
@@ -13,7 +15,7 @@ Usage:
   pythonw publisher.py            -> loop forever (default every 60 s)
   python  publisher.py --once     -> one publish and exit
   python  publisher.py --dry      -> build state.json locally, no upload
-  python  publisher.py --check    -> show whether the token is present (never prints it)
+  python  publisher.py --check    -> check key/known_hosts/git and remote access (never prints keys)
   python  publisher.py --build-from DIR --out FILE   (offline build from saved files)
 """
 from __future__ import annotations
@@ -30,11 +32,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
-REPO_OWNER = "nikolasserpilli-max"
-REPO_NAME = "trading-demo-hud"
-DATA_BRANCH = "data"
-CRED_TARGET = "trading-demo-hud-publisher"   # Windows Credential Manager entry
+VERSION = "1.1.0"
+DATA_REMOTE = "git@github.com:nikolasserpilli-max/trading-demo-hud-data.git"
 INTERVAL_S = int(os.environ.get("HUD_INTERVAL_S", "60"))
 API_BASE = "http://127.0.0.1:8000"
 API_TIMEOUT = 8
@@ -51,6 +50,9 @@ LEDGER_FILE = STATE_DIR / "closed_ledger.json"
 CURVE_FILE = STATE_DIR / "equity_curve.json"
 LOG_FILE = STATE_DIR / "publisher.log"
 LAST_FILE = STATE_DIR / "last_state.json"
+KEY_FILE = STATE_DIR / "deploy_ed25519"          # private key: generated on the PC, never read by this script
+KNOWN_HOSTS = STATE_DIR / "known_hosts_github"   # github.com host keys (fingerprints verified)
+GIT_DIR = STATE_DIR / "git"
 
 MAGICS = {
     26091301: ("pta", "Paper Trading AI"),
@@ -380,69 +382,87 @@ def build(src: dict, persist: bool = True) -> dict:
         out["pta"] = pta
     return out
 
-# ---------------------------------------------------------------- GitHub (token from Windows Credential Manager)
+# ---------------------------------------------------------------- GitHub push via SSH deploy key
 
-def read_token():
-    if os.name != "nt":
-        return os.environ.get("HUD_GITHUB_TOKEN")  # only for testing off Windows
-    import ctypes
-    from ctypes import wintypes
-
-    class CREDENTIAL(ctypes.Structure):
-        _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD), ("TargetName", wintypes.LPWSTR),
-                    ("Comment", wintypes.LPWSTR), ("LastWritten", wintypes.FILETIME),
-                    ("CredentialBlobSize", wintypes.DWORD), ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
-                    ("Persist", wintypes.DWORD), ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
-                    ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR)]
-    adv = ctypes.WinDLL("advapi32", use_last_error=True)
-    pcred = ctypes.POINTER(CREDENTIAL)()
-    if not adv.CredReadW(CRED_TARGET, 1, 0, ctypes.byref(pcred)):
-        return None
-    try:
-        c = pcred.contents
-        blob = bytes(c.CredentialBlob[i] for i in range(c.CredentialBlobSize))
-        tok = blob.decode("utf-16-le") if b"\x00" in blob else blob.decode("utf-8")
-        return tok.strip() or None
-    finally:
-        adv.CredFree(pcred)
+def find_git():
+    import shutil
+    for c in (shutil.which("git"), r"C:\Program Files\Git\cmd\git.exe", str(STATE_DIR / "PortableGit" / "cmd" / "git.exe")):
+        if c and Path(c).exists():
+            return c
+    return None
 
 
-def gh(method, path, token, body=None):
-    url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}{path}"
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "trading-demo-hud-publisher",
-        "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read() or b"{}").get("message", "")
-        except Exception:
-            msg = ""
-        return e.code, {"message": msg}
+def find_ssh():
+    for c in (r"C:\Windows\System32\OpenSSH\ssh.exe", r"C:\Program Files\Git\usr\bin\ssh.exe"):
+        if Path(c).exists():
+            return c
+    return "ssh"
 
 
-def publish(state: dict, token: str) -> bool:
-    content = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
-    s, tree = gh("POST", "/git/trees", token, {"tree": [
-        {"path": "state.json", "mode": "100644", "type": "blob", "content": content}]})
-    if s != 201:
-        log(f"GitHub tree failed: HTTP {s} {tree.get('message','')}")
+def git_env():
+    fwd = lambda x: str(x).replace("\\", "/")
+    env = dict(os.environ)
+    env["GIT_SSH_COMMAND"] = (f'"{fwd(find_ssh())}" -i "{fwd(KEY_FILE)}" -o IdentitiesOnly=yes '
+                              f'-o UserKnownHostsFile="{fwd(KNOWN_HOSTS)}" -o StrictHostKeyChecking=yes '
+                              f'-o UpdateHostKeys=no -o BatchMode=yes -o ConnectTimeout=20')
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.update({"GIT_AUTHOR_NAME": "trading-demo-hud publisher", "GIT_AUTHOR_EMAIL": "publisher@trading-demo-hud.invalid",
+                "GIT_COMMITTER_NAME": "trading-demo-hud publisher", "GIT_COMMITTER_EMAIL": "publisher@trading-demo-hud.invalid"})
+    return env
+
+
+def git(args, inp=None, timeout=60):
+    import subprocess
+    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: never flash a console
+    r = subprocess.run([find_git(), "--git-dir", str(GIT_DIR)] + args, input=inp, capture_output=True,
+                       env=git_env(), timeout=timeout, creationflags=flags)
+    return r.returncode, r.stdout.decode("utf-8", "replace").strip(), r.stderr.decode("utf-8", "replace").strip()
+
+
+_cycles = 0
+
+
+def publish(state: dict) -> bool:
+    global _cycles
+    if not find_git():
+        log("git not found; nothing published")
         return False
-    s, commit = gh("POST", "/git/commits", token, {"message": "data: snapshot", "tree": tree["sha"], "parents": []})
-    if s != 201:
-        log(f"GitHub commit failed: HTTP {s} {commit.get('message','')}")
+    if not KEY_FILE.exists() or not KNOWN_HOSTS.exists():
+        log("deploy key or known_hosts missing; nothing published")
         return False
-    s, r = gh("PATCH", f"/git/refs/heads/{DATA_BRANCH}", token, {"sha": commit["sha"], "force": True})
-    if s == 422 or s == 404:
-        s, r = gh("POST", "/git/refs", token, {"ref": f"refs/heads/{DATA_BRANCH}", "sha": commit["sha"]})
-    if s not in (200, 201):
-        log(f"GitHub ref update failed: HTTP {s} {r.get('message','')}")
-        return False
+    if not (GIT_DIR / "HEAD").exists():
+        GIT_DIR.parent.mkdir(parents=True, exist_ok=True)
+        c, _, e = git(["init", "--bare", "-q"])
+        if c:
+            log(f"git init failed: {e[:200]}")
+            return False
+    content = json.dumps(state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    c, blob, e = git(["hash-object", "-w", "--stdin"], content)
+    if c:
+        log(f"git hash-object failed: {e[:200]}"); return False
+    c, tree, e = git(["mktree"], f"100644 blob {blob}\tstate.json\n".encode())
+    if c:
+        log(f"git mktree failed: {e[:200]}"); return False
+    c, commit, e = git(["commit-tree", tree, "-m", "data: snapshot"])
+    if c:
+        log(f"git commit-tree failed: {e[:200]}"); return False
+    c, _, e = git(["push", "--force", "-q", DATA_REMOTE, f"{commit}:refs/heads/main"], timeout=90)
+    if c:
+        log(f"git push failed: {e[:300]}"); return False
+    _cycles += 1
+    if _cycles % 60 == 1:
+        git(["prune", "--expire=now"])  # drop old snapshots kept locally
     return True
+
+
+def check_remote() -> bool:
+    c, out, e = git(["ls-remote", DATA_REMOTE, "refs/heads/main"], timeout=60) if (GIT_DIR / "HEAD").exists() else (None, "", "")
+    if c is None:
+        GIT_DIR.parent.mkdir(parents=True, exist_ok=True)
+        git(["init", "--bare", "-q"])
+        c, out, e = git(["ls-remote", DATA_REMOTE, "refs/heads/main"], timeout=60)
+    print("accesso al repo dati:", "ok" if c == 0 else f"ERRORE {e[:300]}")
+    return c == 0
 
 # ---------------------------------------------------------------- main
 
@@ -462,12 +482,7 @@ def run_once(dry=False) -> bool:
     if dry:
         log(f"DRY ok -> {LAST_FILE}")
         return True
-    token = read_token()
-    if not token:
-        log(f"token missing in Windows Credential Manager (target '{CRED_TARGET}'); nothing published")
-        return False
-    ok = publish(state, token)
-    del token
+    ok = publish(state)
     if ok:
         acc = state.get("account") or {}
         log(f"published ok (equity {acc.get('equity')}, positions {len(state.get('positions') or [])})")
@@ -487,7 +502,10 @@ def main():
         Path(a.out or "state.json").write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
         return
     if a.check:
-        print("token presente" if read_token() else "token MANCANTE")
+        print("chiave deploy:", "presente" if KEY_FILE.exists() else "MANCANTE")
+        print("known_hosts:", "presente" if KNOWN_HOSTS.exists() else "MANCANTE")
+        print("git:", find_git() or "MANCANTE")
+        check_remote()
         print("EA status:", "ok" if EA_STATUS.exists() else "non trovato")
         print("API:", "ok" if api_get("/health", 5) else "non raggiungibile")
         return
